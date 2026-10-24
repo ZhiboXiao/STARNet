@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+data/
+runs/
+weights/
+*.pt
+*.pth
+*.npy
+*.npz
+*.mat

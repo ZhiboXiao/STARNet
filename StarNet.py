@@ -1,19 +1,26 @@
-""" Full assembly of the parts to form the complete network """
+"""StarNet: grouped sensor encoding and U-shaped signal reconstruction."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# from model.swinseg import SwinTransformer
 
-# torch.set_default_dtype(torch.float64)
 
 class StarNet(nn.Module):
-    def __init__(self, n_channels, n_classes, bilinear=False):
-        super(UNet, self).__init__()
+    """Map [B, C, S, T] to [B, 1, S * R, T].
+
+    n_channels is C; the historical name n_classes denotes the expansion
+    factor R, not semantic classes. sensors is S and must be supplied.
+    """
+
+    def __init__(self, n_channels, n_classes, bilinear=False, *, sensors):
+        super().__init__()
+        if min(n_channels, n_classes) < 1 or sensors < 16:
+            raise ValueError("Channels and expansion must be positive; sensors must be >= 16.")
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
+        self.sensors = sensors
 
-        self.inc =InConv(n_channels, 64, 128)
+        self.inc = InConv(n_channels, 64, sensors)
         self.down1 = (Down(64, 128))
         self.down2 = (Down(128, 256))
         self.down3 = (Down(256, 512))
@@ -28,8 +35,15 @@ class StarNet(nn.Module):
 
 
     def forward(self, x):
-        output = torch.zeros(x.shape[0], 1, x.shape[2]*self.n_classes, x.shape[3]).to(x.device)
-        x = x.squeeze(1)
+        if x.ndim != 4 or x.shape[1:3] != (self.n_channels, self.sensors):
+            raise ValueError(f"Expected [B, {self.n_channels}, {self.sensors}, T], got {tuple(x.shape)}")
+        if x.shape[-1] < 16:
+            raise ValueError("T must be >= 16 for four pooling stages.")
+        if self.training and x.shape[0] * (self.sensors // 16) * (x.shape[-1] // 16) <= 1:
+            raise ValueError("BatchNorm needs B * floor(S/16) * floor(T/16) > 1 during training.")
+        batch, _, sensors, length = x.shape
+        # Adjacent channels belong to one sensor in the grouped Conv1d input.
+        x = x.permute(0, 2, 1, 3).reshape(batch, sensors * self.n_channels, length)
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
@@ -40,12 +54,11 @@ class StarNet(nn.Module):
         x = self.up3(x, x2)
         x = self.up4(x, x1)
         logits = self.outc(x)
-        for i in range(self.n_classes):
-            output[:, :, i::self.n_classes, :] = logits[:, i:i+1, :, :]
-        return output
+        # output[b, 0, s * R + r, t] = logits[b, r, s, t]
+        return logits.permute(0, 2, 1, 3).reshape(batch, 1, sensors * self.n_classes, length)
 
 class DoubleConv(nn.Module):
-    """(convolution => [BN] => ReLU) * 2"""
+    """Two convolution / BatchNorm / Tanh stages."""
 
     def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
@@ -94,7 +107,7 @@ class Up(nn.Module):
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
-        # input is CHW
+        # Align spatial dimensions with the encoder skip connection.
         diffY = x2.size()[2] - x1.size()[2]
         diffX = x2.size()[3] - x1.size()[3]
 
@@ -121,13 +134,12 @@ class OutConv(nn.Module):
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
             nn.Conv2d(in_channels, out_channels, kernel_size=1)
         )
-        # self.relu = nn.LeakyReLU()
 
     def forward(self, x):
         x1 = self.conv1(x)
         x2 = self.conv2(x+x1)
         return x2
-    
+
 
 class InConv(nn.Module):
     def __init__(self, in_channels, out_channels, sensors):
@@ -135,35 +147,34 @@ class InConv(nn.Module):
         self.sensors = sensors
         self.dim = 16
         self.conv1 = nn.Sequential(
-            # 输入通道数 = max_sensors
-            nn.Conv1d(in_channels=in_channels*sensors, 
-                     out_channels=4*sensors, 
-                     kernel_size=5, 
+            # Each group processes the channels of a single sensor.
+            nn.Conv1d(in_channels=in_channels*sensors,
+                     out_channels=4*sensors,
+                     kernel_size=5,
                      padding=2,
-                     groups=sensors),  # 参数隔离关键
+                     groups=sensors),
             nn.BatchNorm1d(4*sensors),
             nn.Tanh(),
-            nn.Conv1d(4*sensors, 
-                     self.dim*sensors, 
-                     kernel_size=3, 
+            nn.Conv1d(4*sensors,
+                     self.dim*sensors,
+                     kernel_size=3,
                      padding=1,
                      groups=sensors),
             nn.BatchNorm1d(self.dim*sensors),
             nn.Tanh(),
-            nn.Conv1d(self.dim*sensors, 
-                     out_channels*sensors, 
-                     kernel_size=3, 
+            nn.Conv1d(self.dim*sensors,
+                     out_channels*sensors,
+                     kernel_size=3,
                      padding=1,
                      groups=sensors)
         )
         self.conv2 = DoubleConv(out_channels, out_channels)
         self.conv3 = DoubleConv(out_channels, out_channels)
-        # self.relu = nn.LeakyReLU()asd
 
     def forward(self, x):
-        B, H, W = x.shape
+        B, _, W = x.shape
         x1 = self.conv1(x)
-        x1 = x1.view(B,H, -1, W)
+        x1 = x1.view(B, self.sensors, -1, W)
         x1 = x1.permute(0,2,1,3)
         x2 = self.conv2(x1)
         x3 = self.conv3(x1+x2)
@@ -174,18 +185,3 @@ def xavier_init(module):
         nn.init.xavier_normal_(module.weight, gain=nn.init.calculate_gain('tanh'))
         if module.bias is not None:
             nn.init.zeros_(module.bias)
-
-if __name__ == '__main__':
-
-    height = 256
-    width = 2048
-    x = torch.randn((1, 1, height, width)).cuda()
-    coord = torch.randn((1, 1,height,3)).cuda()
-    dist = torch.randn((1, 1,5*height,height)).cuda()
-    model = StarNet(1,4).cuda()
-        # print(model)
-    print('input image size: (%d, %d)' % (height, width))
-    for i in range(100):
-        # print('FLOPs: %.4f G' % (model.flops() / 1e9))
-        x = model(x)
-        print('output image size: ', x.shape)
